@@ -1,0 +1,95 @@
+name: Android APK
+
+on:
+  push:
+    branches: [ master ]
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      abi:
+        description: "ANDROID_ABI (arm64-v8a, armeabi-v7a, x86_64, x86)"
+        default: "arm64-v8a"
+        required: false
+
+jobs:
+  apk:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+
+    env:
+      QT_VERSION: "6.8.3"                   # Qt 6 LTS
+      NDK_VERSION: "26.1.10909125"          # NDK that Qt 6.8 is built against
+      ANDROID_PLATFORM: "34"
+      BUILD_TOOLS: "34.0.0"
+      ANDROID_ABI: ${{ github.event.inputs.abi || 'arm64-v8a' }}
+      JOBS: "4"
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Host build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential git make ninja-build \
+            pkg-config python3 python3-pip libgl1-mesa-dev
+          python3 -m pip install --user --break-system-packages "meson>=1.0"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Android SDK / NDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install SDK platform, build-tools and NDK
+        run: |
+          yes | sdkmanager --licenses >/dev/null || true
+          sdkmanager "platforms;android-${ANDROID_PLATFORM}" \
+                     "build-tools;${BUILD_TOOLS}" \
+                     "ndk;${NDK_VERSION}"
+          echo "ANDROID_NDK_ROOT=${ANDROID_SDK_ROOT}/ndk/${NDK_VERSION}" >> "$GITHUB_ENV"
+
+      # Qt for Android + matching desktop host tools (installed automatically)
+      - name: Install Qt for Android
+        uses: jurplel/install-qt-action@v4
+        with:
+          version: ${{ env.QT_VERSION }}
+          host: linux
+          target: android
+          arch: android_${{ env.ANDROID_ABI == 'arm64-v8a' && 'arm64_v8a' || env.ANDROID_ABI == 'armeabi-v7a' && 'armv7' || env.ANDROID_ABI }}
+          cache: true
+
+      - name: Check prerequisites
+        run: |
+          export QT_ANDROID="$QT_ROOT_DIR"
+          echo "QT_ANDROID=$QT_ANDROID" >> "$GITHUB_ENV"
+          chmod +x scripts/android.sh
+          ./scripts/android.sh --check
+
+      - name: Cache radare2 / meson subprojects
+        uses: actions/cache@v4
+        with:
+          path: build-android/${{ env.ANDROID_ABI }}/radare2
+          key: r2-${{ env.ANDROID_ABI }}-${{ env.NDK_VERSION }}-${{ github.run_id }}
+          restore-keys: r2-${{ env.ANDROID_ABI }}-${{ env.NDK_VERSION }}-
+
+      - name: Build APK
+        run: ./scripts/android.sh
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: iaito-android-${{ env.ANDROID_ABI }}
+          path: iaito-*.apk
+          if-no-files-found: error
+
+      - name: Upload build logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: android-build-logs
+          path: |
+            build-android/**/*.log
+            build-android/**/meson-logs/**
+          if-no-files-found: ignore
