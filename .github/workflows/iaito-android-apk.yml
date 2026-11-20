@@ -1,0 +1,205 @@
+name: Build iaito Android APK
+
+on:
+  workflow_dispatch:
+    inputs:
+      r2_ref:
+        description: 'radare2 Git ref (branch, tag, or commit; HEAD uses the latest master)'
+        required: true
+        default: 'HEAD'
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: iaito-android-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-android:
+    name: Build arm64-v8a APK
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+
+    env:
+      QT_VERSION: '6.10.3'
+      ANDROID_NDK_VERSION: '27.2.12479018'
+      ANDROID_ABI: 'arm64-v8a'
+      ANDROID_MIN_SDK: '28'
+      ANDROID_TARGET_SDK: '36'
+      JOBS: '4'
+
+    steps:
+      - name: Checkout iaito source
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Set up JDK
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
+
+      - name: Install host build dependencies
+        shell: bash
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential \
+            git \
+            make \
+            pkg-config \
+            curl \
+            unzip \
+            zip
+          python -m pip install --upgrade pip
+          python -m pip install 'meson>=0.63' ninja
+
+      - name: Set up Android SDK command-line tools
+        uses: android-actions/setup-android@v4
+
+      - name: Install Android SDK, build-tools and NDK
+        shell: bash
+        run: |
+          sdkmanager --install \
+            'platform-tools' \
+            'platforms;android-36' \
+            'build-tools;36.0.0' \
+            "ndk;${ANDROID_NDK_VERSION}"
+
+      - name: Install Qt for Android
+        id: qt
+        uses: jurplel/install-qt-action@v4
+        with:
+          version: ${{ env.QT_VERSION }}
+          host: all_os
+          target: android
+          arch: android_arm64_v8a
+          archives: 'qtbase qtsvg'
+          cache: true
+
+      # Qt 6.10.3 host tools are linked against ICU 73.2. Ubuntu 24.04
+      # ships ICU 74, and the Qt desktop archive does not bundle ICU. Build
+      # the exact ICU runtime version required by qmake from the official
+      # Unicode release source instead of copying incompatible libraries.
+      - name: Build ICU 73.2 host runtime
+        shell: bash
+        run: |
+          set -euxo pipefail
+          curl --fail --location --retry 3 \
+            https://github.com/unicode-org/icu/releases/download/release-73-2/icu4c-73_2-src.tgz \
+            --output "$RUNNER_TEMP/icu4c-73_2-src.tgz"
+          mkdir -p "$RUNNER_TEMP/icu-src" "$RUNNER_TEMP/icu73"
+          tar -xzf "$RUNNER_TEMP/icu4c-73_2-src.tgz" -C "$RUNNER_TEMP/icu-src"
+          cd "$RUNNER_TEMP/icu-src/icu/source"
+          ./configure \
+            --prefix="$RUNNER_TEMP/icu73" \
+            --disable-samples \
+            --disable-tests \
+            --enable-shared \
+            --disable-static
+          make -j2
+          make install
+          test -f "$RUNNER_TEMP/icu73/lib/libicui18n.so.73"
+          test -f "$RUNNER_TEMP/icu73/lib/libicuuc.so.73"
+          test -f "$RUNNER_TEMP/icu73/lib/libicudata.so.73"
+          echo "ICU73_LIB=$RUNNER_TEMP/icu73/lib" >> "$GITHUB_ENV"
+
+      - name: Configure Android build environment
+        shell: bash
+        env:
+          QT_ANDROID_ROOT: ${{ steps.qt.outputs.qt-root-dir }}
+          QT_HOST_ROOT: ${{ steps.qt.outputs.qt-host-path }}
+        run: |
+          SDK_ROOT="${ANDROID_SDK_ROOT:-${ANDROID_HOME:-}}"
+          if [[ -z "$SDK_ROOT" ]]; then
+            echo 'Android SDK path was not set by setup-android.' >&2
+            exit 1
+          fi
+
+          if [[ ! -x "$QT_ANDROID_ROOT/bin/qmake" ]]; then
+            echo "Qt Android qmake not found: $QT_ANDROID_ROOT/bin/qmake" >&2
+            exit 1
+          fi
+          if [[ ! -x "$QT_HOST_ROOT/bin/qmake6" ]]; then
+            echo "Qt host qmake6 not found: $QT_HOST_ROOT/bin/qmake6" >&2
+            exit 1
+          fi
+
+          # Qt host tools require ICU 73; use the separately built exact
+          # runtime. Do not rename/symlink Ubuntu's ICU 74 libraries.
+          if [[ ! -d "$ICU73_LIB" ]]; then
+            echo "ICU 73 runtime directory missing: $ICU73_LIB" >&2
+            exit 1
+          fi
+          export LD_LIBRARY_PATH="$ICU73_LIB:$QT_HOST_ROOT/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+          echo "LD_LIBRARY_PATH=$LD_LIBRARY_PATH" >> "$GITHUB_ENV"
+
+          echo "Checking host qmake6 shared-library dependencies:"
+          ldd "$QT_HOST_ROOT/bin/qmake6" | tee "$RUNNER_TEMP/iaito-qmake6-ldd.txt"
+          if grep -q 'not found' "$RUNNER_TEMP/iaito-qmake6-ldd.txt"; then
+            echo 'Host qmake6 still has unresolved shared libraries.' >&2
+            exit 1
+          fi
+
+          echo "Checking Android qmake wrapper:"
+          "$QT_ANDROID_ROOT/bin/qmake" -query QT_VERSION
+
+          if [[ ! -f "$QT_ANDROID_ROOT/lib/libQt6SvgWidgets_arm64-v8a.so" ]]; then
+            echo 'Qt SVG for arm64-v8a is missing from the installed Qt kit.' >&2
+            exit 1
+          fi
+          if [[ ! -d "$SDK_ROOT/ndk/$ANDROID_NDK_VERSION" ]]; then
+            echo 'Requested Android NDK was not installed.' >&2
+            exit 1
+          fi
+
+          echo "QT_ANDROID=$QT_ANDROID_ROOT" >> "$GITHUB_ENV"
+          echo "QT_HOST_PATH=$QT_HOST_ROOT" >> "$GITHUB_ENV"
+          echo "ANDROID_SDK_ROOT=$SDK_ROOT" >> "$GITHUB_ENV"
+          echo "ANDROID_HOME=$SDK_ROOT" >> "$GITHUB_ENV"
+          echo "ANDROID_NDK_ROOT=$SDK_ROOT/ndk/$ANDROID_NDK_VERSION" >> "$GITHUB_ENV"
+          echo "BUILD_DIR=$RUNNER_TEMP/iaito-android-arm64" >> "$GITHUB_ENV"
+          echo "APK_OUTPUT=$GITHUB_WORKSPACE/iaito-android-arm64-v8a.apk" >> "$GITHUB_ENV"
+
+          echo "Qt Android kit: $QT_ANDROID_ROOT"
+          echo "Qt host tools: $QT_HOST_ROOT"
+          echo "ICU 73 runtime: $ICU73_LIB"
+          echo "Android SDK: $SDK_ROOT"
+          echo "Android NDK: $SDK_ROOT/ndk/$ANDROID_NDK_VERSION"
+
+      - name: Check Android build prerequisites
+        run: ./scripts/android.sh --check
+
+      - name: Build iaito APK
+        shell: bash
+        env:
+          R2_REF: ${{ inputs.r2_ref }}
+        run: |
+          ./scripts/android.sh
+          test -s "$APK_OUTPUT"
+
+      - name: Verify APK signature and package
+        shell: bash
+        run: |
+          APKSIGNER="$ANDROID_SDK_ROOT/build-tools/36.0.0/apksigner"
+          AAPT="$ANDROID_SDK_ROOT/build-tools/36.0.0/aapt"
+
+          "$APKSIGNER" verify --verbose "$APK_OUTPUT"
+          "$AAPT" dump badging "$APK_OUTPUT" | head -n 3
+          sha256sum "$APK_OUTPUT"
+
+      - name: Upload ready-to-install APK
+        uses: actions/upload-artifact@v7
+        with:
+          name: iaito-android-arm64-v8a
+          path: ${{ github.workspace }}/iaito-android-arm64-v8a.apk
+          if-no-files-found: error
+          retention-days: 14
